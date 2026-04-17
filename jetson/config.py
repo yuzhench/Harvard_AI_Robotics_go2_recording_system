@@ -14,9 +14,10 @@ TASKS = [
 ]
 
 # Root directory where session folders are created on the Jetson.
-# Mirrored on the laptop by camera_record_pipeline so that
-# `rsync unitree@<jetson>:/home/GO2_DATA/ /home/GO2_DATA/` merges cleanly.
-DATA_ROOT = "/home/GO2_DATA"
+# Lives under the unitree user's home so we don't need sudo/chown to
+# create it. On the laptop the corresponding path is configurable per
+# session via the frontend "Save Directory" input.
+DATA_ROOT = "/home/unitree/GO2_DATA"
 
 # Network interface used by the Unitree SDK for DDS traffic to the Go2 main
 # board. Must be the Jetson's on-board ethernet (reaches 192.168.123.0/24).

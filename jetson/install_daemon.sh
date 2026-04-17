@@ -6,7 +6,7 @@
 #     sudo bash jetson/install_daemon.sh
 #
 # What it does (idempotent):
-#   1. Ensures /home/GO2_DATA exists and is writable by `unitree`.
+#   1. Ensures /home/unitree/GO2_DATA exists and is writable by `unitree`.
 #   2. Copies record_daemon.service to /etc/systemd/system/.
 #   3. Reloads systemd, enables + starts the service.
 #   4. Prints current status so you can verify it came up cleanly.
@@ -21,7 +21,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_SRC="$REPO_DIR/jetson/record_daemon.service"
 SERVICE_DST="/etc/systemd/system/record_daemon.service"
-DATA_DIR="/home/GO2_DATA"
+DATA_DIR="/home/unitree/GO2_DATA"
 
 if [[ $EUID -ne 0 ]]; then
     echo "This script must run as root. Re-run with: sudo bash $0" >&2
