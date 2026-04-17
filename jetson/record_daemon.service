@@ -1,0 +1,23 @@
+[Unit]
+Description=Go2 Record Daemon (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+WorkingDirectory=/home/unitree/Desktop/go2_record_pipeline
+Environment="PATH=/home/unitree/miniconda3/envs/go2/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+# Preload libgomp to avoid "cannot allocate memory in static TLS block" when
+# cv2 pulls in OpenMP after the Python interpreter is already running.
+Environment="LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1"
+ExecStart=/home/unitree/miniconda3/envs/go2/bin/python -m jetson.record_daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
