@@ -1,195 +1,391 @@
 """
-egocentric_camera.py — Collect Go2 EDU front camera frames.
+egocentric_camera.py — Collect RGB + Depth from the on-robot RealSense
+D435I mounted on the Go2.
 
-Uses Go2VideoClient from unitree_sdk2_python to grab frames from the
-robot's built-in front-facing camera, saves as MP4 + timestamps NPZ.
+Hardware: single Intel RealSense D435I plugged into the Jetson via USB 3.
+Output format mirrors the 4× third-person cameras handled by
+camera_record_pipeline so downstream alignment code can treat them
+identically:
 
-Usage:
-    from utility.egocentric_camera import EgocentricCameraCollector
+    <save_dir>/ego_cam/
+        rgb.mp4              H.264 color video at configured fps
+        rgb_timestamps.npy   (F,)  float64  per-frame Unix timestamps
+        depth.npz            {"depth": (F, H, W) uint16, "timestamps": (F,) float64}
+        intrinsics.json      color + depth intrinsics, depth_scale, serial, name
 
-    collector = EgocentricCameraCollector(network_interface="eth0")
-    collector.start()
-    # ... robot is moving ...
-    collector.stop()
-    collector.save(Path("data/task1/session/robot"))
+RGB and depth frames are 1:1 aligned (same `align_to=color` + same host
+timestamp) and share the timestamp array — loading rgb_timestamps.npy OR
+depth.npz["timestamps"] gives the identical per-frame times.
 """
 
+import json
+import subprocess
 import threading
 import time
 from collections import deque
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
 
 try:
-    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-    from unitree_sdk2py.go2.video.video_client import VideoClient
-    SDK_AVAILABLE = True
+    import pyrealsense2 as rs
+    REALSENSE_AVAILABLE = True
 except ImportError:
-    SDK_AVAILABLE = False
-    print("[EgocentricCamera] WARNING: unitree_sdk2py not found — running in mock mode")
+    REALSENSE_AVAILABLE = False
+    print("[EgoRealSense] WARNING: pyrealsense2 not installed — running in mock mode")
 
-# Go2 front camera native resolution
-CAMERA_WIDTH  = 1280
-CAMERA_HEIGHT = 720
-TARGET_FPS    = 30
+
+WIDTH_DEFAULT = 640
+HEIGHT_DEFAULT = 480
+FPS_DEFAULT = 30
 
 
 class EgocentricCameraCollector:
     """
-    Captures frames from the Go2 EDU's built-in front camera.
+    Single-camera RGB+Depth collector for the on-robot RealSense.
 
-    Buffers frames in memory during recording, then saves:
-        ego_rgb.mp4      — color video (H.264)
-        ego_timestamps.npy — Unix timestamps per frame (float64)
+    API parity with other utility/ collectors:
+        start()   — begin capture in a background thread
+        stop()    — stop capture; frames remain buffered in memory
+        save(p)   — flush buffered frames to <p>/ego_cam/
+        frame_count   — property for current buffered frame count
     """
 
-    def __init__(self, network_interface: str = "eth0",
-                 width: int = CAMERA_WIDTH, height: int = CAMERA_HEIGHT,
-                 fps: int = TARGET_FPS):
+    # Remux MP4 with ffmpeg when actual fps diverges from declared by more
+    # than this fraction (e.g. 30 vs 27 → mild; 30 vs 20 → remux kicks in).
+    FPS_FIX_THRESHOLD = 0.05
+
+    # Sliding-window size for live FPS reporting (seconds of history kept).
+    _FPS_WINDOW_S = 1.0
+
+    def __init__(
+        self,
+        network_interface: str = "eth0",     # unused; kept for API parity
+        width: int = WIDTH_DEFAULT,
+        height: int = HEIGHT_DEFAULT,
+        fps: int = FPS_DEFAULT,
+        serial: Optional[str] = None,        # if None, uses first detected device
+    ):
         self.network_interface = network_interface
-        self.width  = width
+        self.width = width
         self.height = height
-        self.fps    = fps
+        self.fps = fps
+        self.serial = serial
 
-        self._lock      = threading.Lock()
-        self._running   = False
-        self._thread    = None
-        self._client    = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._pipeline = None
+        self._profile = None
 
-        # Frame buffer: list of (timestamp, frame_bgr)
-        self._frames: deque[tuple[float, np.ndarray]] = deque()
+        # Buffers — cleared on each start()
+        self._color_frames: list[np.ndarray] = []
+        self._depth_frames: list[np.ndarray] = []
+        self._timestamps:  list[float] = []
+        self._intrinsics:  dict = {}
+        # Sliding-window frame timestamps for live fps reporting.
+        self._fps_window:  deque[float] = deque()
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def start(self):
-        """Initialize video client and begin capturing frames."""
         if self._running:
             return
-
         self._running = True
-        self._frames.clear()
+        self._clear_buffers()
 
-        if not SDK_AVAILABLE:
+        if not REALSENSE_AVAILABLE:
             self._start_mock()
             return
 
-        self._client = VideoClient()
-        self._client.SetTimeout(3.0)
-        self._client.Init()
+        self._pipeline = rs.pipeline()
+        config = rs.config()
+        if self.serial:
+            config.enable_device(self.serial)
+        config.enable_stream(
+            rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps
+        )
+        config.enable_stream(
+            rs.stream.depth, self.width, self.height, rs.format.z16, self.fps
+        )
+        self._profile = self._pipeline.start(config)
+
+        # Cache intrinsics once — they don't change during streaming.
+        self._intrinsics = self._read_intrinsics(self._profile)
 
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
-        print(f"[EgocentricCamera] Started capture on {self.network_interface}")
+        print(
+            f"[EgoRealSense] Started {self._intrinsics['name']} "
+            f"(serial {self._intrinsics['serial']}) "
+            f"{self.width}x{self.height} @ {self.fps} fps"
+        )
 
     def stop(self):
-        """Stop capturing. Frames remain in memory until save() is called."""
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             self._thread = None
-        print(f"[EgocentricCamera] Stopped. Buffered {len(self._frames)} frames.")
+        if self._pipeline is not None:
+            try:
+                self._pipeline.stop()
+            except Exception:
+                pass
+            self._pipeline = None
+        print(f"[EgoRealSense] Stopped. Buffered {len(self._timestamps)} frames.")
 
     def save(self, save_dir: Path):
         """
-        Flush buffered frames to disk.
+        Flush frames to <save_dir>/ego_cam/.
 
-        Outputs:
-            ego_rgb.mp4          — H.264 video
-            ego_timestamps.npy   — shape (N,) float64 Unix timestamps
+        Returns a summary dict suitable for the daemon's stop() response.
         """
         save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
+        cam_dir = save_dir / "ego_cam"
+        cam_dir.mkdir(parents=True, exist_ok=True)
 
         with self._lock:
-            frames_snapshot = list(self._frames)
+            color_snap = list(self._color_frames)
+            depth_snap = list(self._depth_frames)
+            ts_snap    = list(self._timestamps)
+            intr_snap  = dict(self._intrinsics)
 
-        if not frames_snapshot:
-            print("[EgocentricCamera] No frames to save.")
+        if not color_snap:
+            print("[EgoRealSense] No frames to save.")
             return {"frames": 0}
 
-        timestamps = np.array([f[0] for f in frames_snapshot], dtype=np.float64)
+        n = len(color_snap)
+        timestamps = np.array(ts_snap, dtype=np.float64)
+        duration = float(timestamps[-1] - timestamps[0]) if n > 1 else 0.0
+        actual_fps = (n / duration) if duration > 0 else float(self.fps)
 
+        # intrinsics.json
+        (cam_dir / "intrinsics.json").write_text(json.dumps(intr_snap, indent=2))
+
+        # rgb.mp4 (declared fps initially; remuxed below if actual diverges)
+        mp4_path = cam_dir / "rgb.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(
-            str(save_dir / "ego_rgb.mp4"),
-            fourcc, self.fps, (self.width, self.height)
+            str(mp4_path), fourcc, float(self.fps), (self.width, self.height)
         )
-        for _, frame in frames_snapshot:
+        for frame in color_snap:
             writer.write(frame)
         writer.release()
 
-        np.save(str(save_dir / "ego_timestamps.npy"), timestamps)
+        # rgb_timestamps.npy (per-frame host timestamps, shared with depth)
+        np.save(cam_dir / "rgb_timestamps.npy", timestamps)
 
-        n = len(frames_snapshot)
-        duration = round(float(timestamps[-1] - timestamps[0]), 2) if n > 1 else 0.0
-        actual_fps = round(n / duration, 1) if duration > 0 else 0.0
-        print(f"[EgocentricCamera] Saved {n} frames, {duration}s, ~{actual_fps} fps → {save_dir}")
-        return {"frames": n, "duration_s": duration, "fps": actual_fps}
+        # depth.npz — color-aligned uint16 depth frames + same timestamps
+        depth_array = np.stack(depth_snap, axis=0)   # (F, H, W) uint16
+        np.savez_compressed(
+            cam_dir / "depth.npz",
+            depth=depth_array,
+            timestamps=timestamps,
+        )
 
-    def get_latest_frame(self) -> np.ndarray | None:
-        """Return the most recent frame (BGR) for live preview, or None."""
-        with self._lock:
-            if not self._frames:
-                return None
-            return self._frames[-1][1].copy()
+        # Optional: fix MP4 fps metadata if actual differs from declared.
+        mp4_fps_fixed = False
+        if (
+            self.fps > 0
+            and n > 1
+            and abs(actual_fps - self.fps) / self.fps > self.FPS_FIX_THRESHOLD
+        ):
+            mp4_fps_fixed = self._remux_mp4_fps(mp4_path, actual_fps)
+
+        info = {
+            "frames":         n,
+            "duration_s":     round(duration, 2),
+            "actual_fps":     round(actual_fps, 2),
+            "target_fps":     self.fps,
+            "mp4_fps_fixed":  mp4_fps_fixed,
+        }
+        print(
+            f"[EgoRealSense] Saved {n} frames, {duration:.2f}s, "
+            f"~{actual_fps:.1f} fps → {cam_dir}"
+        )
+        return info
 
     @property
     def frame_count(self) -> int:
-        return len(self._frames)
+        return len(self._timestamps)
+
+    @property
+    def recent_fps(self) -> float:
+        """Frames captured in the last _FPS_WINDOW_S seconds (sliding)."""
+        if not self._running:
+            return 0.0
+        now = time.time()
+        cutoff = now - self._FPS_WINDOW_S
+        with self._lock:
+            while self._fps_window and self._fps_window[0] < cutoff:
+                self._fps_window.popleft()
+            count = len(self._fps_window)
+        return float(count) / self._FPS_WINDOW_S
 
     # ------------------------------------------------------------------
     # Capture loop
     # ------------------------------------------------------------------
 
     def _capture_loop(self):
-        interval = 1.0 / self.fps
+        align = rs.align(rs.stream.color)
         while self._running:
-            t0 = time.monotonic()
             try:
-                # GetImageSample returns raw JPEG bytes from the Go2 camera
-                code, data = self._client.GetImageSample()
-                if code == 0 and data:
-                    ts = time.time()
-                    buf = np.frombuffer(bytes(data), dtype=np.uint8)
-                    frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-                    if frame is not None:
-                        # Resize if camera returns a different resolution
-                        if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                            frame = cv2.resize(frame, (self.width, self.height))
-                        with self._lock:
-                            self._frames.append((ts, frame))
+                frames = self._pipeline.wait_for_frames(timeout_ms=1000)
             except Exception as e:
-                print(f"[EgocentricCamera] Frame error: {e}")
+                # Jetson occasionally hiccups on USB 3 isoc — keep going.
+                if self._running:
+                    print(f"[EgoRealSense] wait_for_frames timeout: {e}")
+                continue
 
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, interval - elapsed))
+            if not frames.get_color_frame() or not frames.get_depth_frame():
+                continue
+
+            aligned = align.process(frames)
+            color_f = aligned.get_color_frame()
+            depth_f = aligned.get_depth_frame()
+            if not color_f or not depth_f:
+                continue
+
+            ts = time.time()
+            # Must .copy() — the underlying RealSense buffers get recycled.
+            color_np = np.asanyarray(color_f.get_data()).copy()
+            depth_np = np.asanyarray(depth_f.get_data()).copy()
+
+            with self._lock:
+                self._color_frames.append(color_np)
+                self._depth_frames.append(depth_np)
+                self._timestamps.append(ts)
+                # Update sliding-window live fps.
+                cutoff = ts - self._FPS_WINDOW_S
+                while self._fps_window and self._fps_window[0] < cutoff:
+                    self._fps_window.popleft()
+                self._fps_window.append(ts)
 
     # ------------------------------------------------------------------
-    # Mock mode
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_intrinsics(profile) -> dict:
+        color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        depth_stream = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        ci = color_stream.get_intrinsics()
+        di = depth_stream.get_intrinsics()
+        depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+        device = profile.get_device()
+        return {
+            "color": {
+                "width": ci.width, "height": ci.height,
+                "fx": ci.fx, "fy": ci.fy,
+                "ppx": ci.ppx, "ppy": ci.ppy,
+                "distortion_model": str(ci.model),
+                "coeffs": list(ci.coeffs),
+            },
+            "depth": {
+                "width": di.width, "height": di.height,
+                "fx": di.fx, "fy": di.fy,
+                "ppx": di.ppx, "ppy": di.ppy,
+                "distortion_model": str(di.model),
+                "coeffs": list(di.coeffs),
+                "depth_scale": depth_scale,
+            },
+            "serial": device.get_info(rs.camera_info.serial_number),
+            "name":   device.get_info(rs.camera_info.name),
+        }
+
+    @staticmethod
+    def _remux_mp4_fps(mp4_path: Path, fps: float) -> bool:
+        """Rewrite MP4 frame-rate metadata with ffmpeg (-c copy, no re-encode)."""
+        tmp = mp4_path.with_suffix(".fps_fix.mp4")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y",
+                 "-r", f"{fps:.4f}",
+                 "-i", str(mp4_path),
+                 "-c", "copy",
+                 str(tmp)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            tmp.replace(mp4_path)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"[EgoRealSense] ffmpeg remux failed ({e}); keeping original rgb.mp4.")
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+            return False
+
+    def _clear_buffers(self):
+        with self._lock:
+            self._color_frames = []
+            self._depth_frames = []
+            self._timestamps = []
+            self._intrinsics = {}
+            self._fps_window.clear()
+
+    # ------------------------------------------------------------------
+    # Mock mode (no camera / running on laptop for dev)
     # ------------------------------------------------------------------
 
     def _start_mock(self):
-        print(f"[EgocentricCamera] Mock mode: generating synthetic frames at {self.fps} Hz")
+        print(f"[EgoRealSense] Mock mode: synthetic frames at {self.fps} Hz")
+        # Pre-fill mock intrinsics so save() produces a valid intrinsics.json.
+        self._intrinsics = {
+            "color": {
+                "width": self.width, "height": self.height,
+                "fx": 600.0, "fy": 600.0,
+                "ppx": self.width / 2, "ppy": self.height / 2,
+                "distortion_model": "Brown Conrady",
+                "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            "depth": {
+                "width": self.width, "height": self.height,
+                "fx": 600.0, "fy": 600.0,
+                "ppx": self.width / 2, "ppy": self.height / 2,
+                "distortion_model": "Brown Conrady",
+                "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+                "depth_scale": 0.001,
+            },
+            "serial": "MOCK-EGO-0000",
+            "name":   "Mock Ego RealSense",
+        }
         self._thread = threading.Thread(target=self._mock_loop, daemon=True)
         self._thread.start()
 
     def _mock_loop(self):
         interval = 1.0 / self.fps
-        frame_idx = 0
+        idx = 0
         while self._running:
             t0 = time.monotonic()
             ts = time.time()
 
-            frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            cv2.putText(frame, f"MOCK ego cam #{frame_idx}", (20, self.height // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 2)
-            frame_idx += 1
+            color = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            cv2.putText(
+                color, f"MOCK ego #{idx}", (20, self.height // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 2,
+            )
+            # Gradient depth — 0.5m to 3m left→right
+            depth = np.tile(
+                np.linspace(500, 3000, self.width, dtype=np.uint16),
+                (self.height, 1),
+            )
 
             with self._lock:
-                self._frames.append((ts, frame))
+                self._color_frames.append(color)
+                self._depth_frames.append(depth)
+                self._timestamps.append(ts)
+                cutoff = ts - self._FPS_WINDOW_S
+                while self._fps_window and self._fps_window[0] < cutoff:
+                    self._fps_window.popleft()
+                self._fps_window.append(ts)
+            idx += 1
 
             time.sleep(max(0.0, interval - (time.monotonic() - t0)))

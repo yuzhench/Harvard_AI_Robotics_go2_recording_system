@@ -72,6 +72,12 @@ class Recorder:
             "lidar_scans": self.lidar.scan_count,
         }
 
+    def live_fps(self) -> dict:
+        """Live per-stream fps (sliding 1s window). Zero when not recording."""
+        return {
+            "ego": round(self.ego.recent_fps, 1),
+        }
+
     def start(self, task: str, prompt: str = "") -> Path:
         """Begin a new recording session.
 
@@ -85,12 +91,18 @@ class Recorder:
             if task not in TASKS:
                 raise ValueError(f"Unknown task {task!r}. Valid tasks: {TASKS}")
 
+            # Session layout (mirrors laptop side so rsync merges cleanly):
+            #   <DATA_ROOT>/<task>/<date>/<time>/first_person/
+            #   ├── imu.npz  joints.npz  contacts.npz
+            #   ├── ego_cam/rgb.mp4 ...
+            #   └── lidar/...
             now = datetime.now()
             session_dir = (
                 self.data_root
                 / task
                 / now.strftime("%m_%d_%Y")
                 / now.strftime("%H_%M_%S")
+                / "first_person"
             )
             session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -111,6 +123,8 @@ class Recorder:
     def stop(self) -> dict:
         """Stop all collectors, flush to disk, return a summary dict.
 
+        State transitions: recording → saving → idle.
+
         Raises:
             RuntimeError — not currently recording
         """
@@ -121,9 +135,11 @@ class Recorder:
             task = self._task
             prompt = self._prompt
             elapsed = self.elapsed
+            # Enter "saving" state so /status reflects that data is being
+            # flushed (LiDAR .npy files especially can take several seconds).
+            self._state = "saving"
 
-        # Stop & save outside the lock — save() may take non-trivial time
-        # (NPZ compression, LiDAR per-scan .npy writes).
+        # Stop collectors (fast) and then save (slow) outside the lock.
         self.imu.stop()
         self.ego.stop()
         self.lidar.stop()

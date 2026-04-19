@@ -6,6 +6,12 @@ list and DATA_ROOT used by camera_record_pipeline so rsync-merged sessions
 end up in matching directory trees.
 """
 
+# Bump whenever the HTTP response shape changes. Must match
+# camera_record_pipeline/backend/config.py::PROTOCOL_VERSION and the
+# frontend's EXPECTED_PROTOCOL_VERSION. The frontend rejects any daemon
+# whose version differs.
+PROTOCOL_VERSION = 4
+
 # Task names accepted by POST /start. Must stay in sync with
 # camera_record_pipeline/backend/config.py for session directory alignment.
 TASKS = [
