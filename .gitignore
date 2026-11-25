@@ -2,3 +2,13 @@ CLAUDE.md
 PLAN.md
 password.txt
 temp_file_for_go2_jetson/
+
+# ESP32 screen firmware
+screen/factory_backup/*.bin
+.pio/
+
+# Local runtime artifacts
+__pycache__/
+*.py[cod]
+data/test_session/
+CODE_VERSION

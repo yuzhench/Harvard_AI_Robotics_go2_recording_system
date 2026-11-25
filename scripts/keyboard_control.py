@@ -8,7 +8,9 @@ Controls:
     Space      Stop
     1          Stand up
     2          Stand down
-    Q          Quit
+    Q / Ctrl-C Quit
+
+Motion stays active after a keypress until Space or another command.
 
 Usage:
     python scripts/keyboard_control.py --interface eth0
@@ -51,7 +53,7 @@ def read_keys():
         while not stop_flag.is_set():
             ch = sys.stdin.read(1)
 
-            if ch in ('q', 'Q'):
+            if ch in ('q', 'Q', '\x03', ''):
                 stop_flag.set()
                 break
 
@@ -83,13 +85,16 @@ def read_keys():
                 vx, vy, vyaw = 0.0, 0.0, 0.0
                 print(f"\r[SPACE] Stop              ", end='', flush=True)
             elif ch == '1':
+                vx, vy, vyaw = 0.0, 0.0, 0.0
                 action = 'standup'
                 print(f"\r[1] Stand up              ", end='', flush=True)
             elif ch == '2':
+                vx, vy, vyaw = 0.0, 0.0, 0.0
                 action = 'standdown'
                 print(f"\r[2] Stand down            ", end='', flush=True)
 
     finally:
+        stop_flag.set()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
@@ -98,22 +103,25 @@ def send_commands(client: SportClient):
     global action
     interval = 1.0 / CMD_HZ
 
-    while not stop_flag.is_set():
-        t0 = time.monotonic()
+    try:
+        while not stop_flag.is_set():
+            t0 = time.monotonic()
 
-        if action == 'standup':
-            client.StandUp()
-            action = None
-        elif action == 'standdown':
-            client.StandDown()
-            action = None
-        else:
-            client.Move(vx, vy, vyaw)
+            if action == 'standup':
+                client.StandUp()
+                action = None
+            elif action == 'standdown':
+                client.StandDown()
+                action = None
+            else:
+                client.Move(vx, vy, vyaw)
 
-        elapsed = time.monotonic() - t0
-        time.sleep(max(0.0, interval - elapsed))
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.0, interval - elapsed))
 
-    client.StopMove()
+    finally:
+        stop_flag.set()
+        client.StopMove()
 
 
 def main():
@@ -138,13 +146,21 @@ def main():
     print("  Q           Quit")
     print("="*40 + "\n")
 
+    terminal_settings = termios.tcgetattr(sys.stdin.fileno())
     t_cmd  = threading.Thread(target=send_commands, args=(client,), daemon=True)
     t_keys = threading.Thread(target=read_keys, daemon=True)
 
     t_cmd.start()
     t_keys.start()
 
-    stop_flag.wait()
+    try:
+        stop_flag.wait()
+    except KeyboardInterrupt:
+        stop_flag.set()
+    finally:
+        t_cmd.join()
+        # The terminal may still be blocked in read(1) if the command thread failed.
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, terminal_settings)
     print("\nQuitting...")
 
 

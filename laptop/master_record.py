@@ -1,8 +1,8 @@
 """
 master_record.py — Laptop-side master controller.
 
-Drives two FastAPI services simultaneously with the same /start /stop /status
-contract, so a single keypress starts or stops both recordings:
+Calls the camera backend, which forwards start/stop to the Jetson and
+assigns the shared session directory name:
 
     - camera_record_pipeline at  http://localhost:8000
       (4× RealSense RGB+Depth, files land on the laptop)
@@ -10,7 +10,8 @@ contract, so a single keypress starts or stops both recordings:
     - Jetson record_daemon   at  http://<jetson-host>:8010
       (IMU+joints+foot, ego camera, LiDAR, files land on the Jetson)
 
-Both services accept POST /start {"task", "prompt"} and POST /stop.
+Set JETSON_URL on the camera backend. --host here only controls the
+Jetson status query; it does not change the backend forwarding address.
 
 Usage:
     python laptop/master_record.py                                 # phswifi3 default
@@ -39,7 +40,7 @@ DEFAULT_JETSON_PORT = 8010
 DEFAULT_CAMERA_URL  = "http://localhost:8000"
 
 TASKS = [f"task{i}" for i in range(1, 11)]
-HTTP_TIMEOUT_S = 10.0
+HTTP_TIMEOUT_S = 90.0
 
 
 @dataclass
@@ -87,34 +88,26 @@ def get_status(endpoints: Endpoints) -> dict:
 # ---------------------------------------------------------------------------
 
 def start_both(task: str, prompt: str, endpoints: Endpoints) -> bool:
-    print("  Starting camera pipeline...")
-    code, body = _post(f"{endpoints.camera}/start", json={"task": task, "prompt": prompt})
+    # The camera backend owns both sides and assigns their shared folder ID.
+    code, body = _post(f"{endpoints.camera}/start", json={
+        "task": task, "prompt": prompt, "use_cameras": True, "use_jetson": True,
+    })
     if code != 200:
-        print(f"  [camera] FAILED ({code}): {body}")
+        print(f"  Start failed ({code}): {body}")
         return False
-    print(f"  [camera] OK: {body.get('session_dir')}")
-
-    print("  Starting Jetson daemon...")
-    code, body = _post(f"{endpoints.jetson}/start", json={"task": task, "prompt": prompt})
-    if code != 200:
-        print(f"  [jetson] FAILED ({code}): {body}")
-        print("  Rolling back camera pipeline...")
+    if not body.get("used_jetson"):
+        print("  Jetson forwarding is disabled on the camera backend; stopping cameras.")
         _post(f"{endpoints.camera}/stop")
         return False
-    print(f"  [jetson] OK: {body.get('session_dir')}")
+    print(f"  Camera: {body.get('session_dir')}")
+    print(f"  Jetson: {body.get('jetson_session_dir')}")
     return True
 
 
 def stop_both(endpoints: Endpoints) -> dict:
-    print("  Stopping Jetson daemon...")
-    jet_code, jet_body = _post(f"{endpoints.jetson}/stop")
-    print(f"  [jetson] {jet_code}: {jet_body}")
-
-    print("  Stopping camera pipeline...")
-    cam_code, cam_body = _post(f"{endpoints.camera}/stop")
-    print(f"  [camera] {cam_code}: {cam_body}")
-
-    return {"camera": cam_body, "jetson": jet_body}
+    code, body = _post(f"{endpoints.camera}/stop")
+    print(f"  Stop ({code}): {body}")
+    return {"camera": body, "jetson": body.get("jetson") or {}}
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,9 @@
+# Install the local Unitree SDK separately; it pins cyclonedds==0.10.2.
+numpy
+opencv-python
+fastapi>=0.115
+starlette>=0.39
+uvicorn
+pyserial
+requests
+# Install pyrealsense2 separately for the target Jetson/JetPack version.

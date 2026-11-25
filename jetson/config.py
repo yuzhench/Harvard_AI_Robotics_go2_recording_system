@@ -19,6 +19,14 @@ TASKS = [
     "task6", "task7", "task8", "task9", "task10",
 ]
 
+# Task folder for recordings started from the on-robot screen, which has no
+# way to pick a task or type a prompt. Sessions are labelled after upload.
+SCREEN_TASK = "unlabeled"
+
+# Discard data before this startup cutoff. Slow hardware startup can exceed
+# this delay; it is not a sensor-readiness or synchronization guarantee.
+START_DELAY_S = 2.0
+
 # Root directory where session folders are created on the Jetson.
 # Lives under the unitree user's home so we don't need sudo/chown to
 # create it. On the laptop the corresponding path is configurable per

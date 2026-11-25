@@ -3,23 +3,24 @@ egocentric_camera.py — Collect RGB + Depth from the on-robot RealSense
 D435I mounted on the Go2.
 
 Hardware: single Intel RealSense D435I plugged into the Jetson via USB 3.
-Output format mirrors the 4× third-person cameras handled by
-camera_record_pipeline so downstream alignment code can treat them
-identically:
+
+Frames are written to disk while recording:
 
     <save_dir>/ego_cam/
-        rgb.mp4              H.264 color video at configured fps
-        rgb_timestamps.npy   (F,)  float64  per-frame Unix timestamps
-        depth.npz            {"depth": (F, H, W) uint16, "timestamps": (F,) float64}
-        intrinsics.json      color + depth intrinsics, depth_scale, serial, name
+        intrinsics.json   color + depth intrinsics, depth_scale, serial, name
+        rgb.mjpeg         JPEG frames, concatenated
+        depth.raw         uint16 depth frames (H*W*2 bytes each), concatenated
+        frames.bin        one FRAME_DTYPE record per frame
 
 RGB and depth frames are 1:1 aligned (same `align_to=color` + same host
-timestamp) and share the timestamp array — loading rgb_timestamps.npy OR
-depth.npz["timestamps"] gives the identical per-frame times.
+timestamp); record i of frames.bin describes frame i of both files.
+scripts/finalize_session.py converts this offline into the layout shared
+with the third-person cameras of camera_record_pipeline (rgb.mp4,
+rgb_timestamps.npy, depth.npz).
 """
 
 import json
-import subprocess
+import queue
 import threading
 import time
 from collections import deque
@@ -29,17 +30,34 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from .streaming import AppendFile, PauseGate
+
 try:
     import pyrealsense2 as rs
     REALSENSE_AVAILABLE = True
 except ImportError:
     REALSENSE_AVAILABLE = False
-    print("[EgoRealSense] WARNING: pyrealsense2 not installed — running in mock mode")
+    print("[EgoRealSense] WARNING: pyrealsense2 not installed — real recording unavailable")
 
 
 WIDTH_DEFAULT = 640
 HEIGHT_DEFAULT = 480
 FPS_DEFAULT = 30
+
+CAM_DIRNAME = "ego_cam"
+RGB_FILENAME = "rgb.mjpeg"
+DEPTH_FILENAME = "depth.raw"
+FRAMES_FILENAME = "frames.bin"
+
+# One record per frame. rgb_offset/rgb_size locate the frame's JPEG inside
+# rgb.mjpeg; the depth frame is at index * H * W * 2 in depth.raw.
+FRAME_DTYPE = np.dtype([
+    ("timestamp",  "<f8"),
+    ("rgb_offset", "<u8"),
+    ("rgb_size",   "<u4"),
+])
+
+JPEG_QUALITY = 95
 
 
 class EgocentricCameraCollector:
@@ -47,18 +65,18 @@ class EgocentricCameraCollector:
     Single-camera RGB+Depth collector for the on-robot RealSense.
 
     API parity with other utility/ collectors:
-        start()   — begin capture in a background thread
-        stop()    — stop capture; frames remain buffered in memory
-        save(p)   — flush buffered frames to <p>/ego_cam/
-        frame_count   — property for current buffered frame count
+        start(p)  — begin capture, streaming frames to <p>/ego_cam/
+        stop()    — stop capture and close the files
+        frame_count   — frames written so far
     """
-
-    # Remux MP4 with ffmpeg when actual fps diverges from declared by more
-    # than this fraction (e.g. 30 vs 27 → mild; 30 vs 20 → remux kicks in).
-    FPS_FIX_THRESHOLD = 0.05
 
     # Sliding-window size for live FPS reporting (seconds of history kept).
     _FPS_WINDOW_S = 1.0
+
+    # Frames waiting for the disk writer. If the disk cannot keep up the
+    # queue fills and further frames are dropped (counted) rather than
+    # letting memory grow without bound.
+    _QUEUE_FRAMES = 90
 
     def __init__(
         self,
@@ -67,8 +85,11 @@ class EgocentricCameraCollector:
         height: int = HEIGHT_DEFAULT,
         fps: int = FPS_DEFAULT,
         serial: Optional[str] = None,        # if None, uses first detected device
+        mock: bool = False,
     ):
         self.network_interface = network_interface
+        self.mock = mock
+        self._error = None
         self.width = width
         self.height = height
         self.fps = fps
@@ -77,47 +98,90 @@ class EgocentricCameraCollector:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._writer_thread: Optional[threading.Thread] = None
+        self._queue: "queue.Queue" = queue.Queue(maxsize=self._QUEUE_FRAMES)
         self._pipeline = None
         self._profile = None
 
-        # Buffers — cleared on each start()
-        self._color_frames: list[np.ndarray] = []
-        self._depth_frames: list[np.ndarray] = []
-        self._timestamps:  list[float] = []
-        self._intrinsics:  dict = {}
+        self._rgb_file: Optional[AppendFile] = None
+        self._depth_file: Optional[AppendFile] = None
+        self._frames_file: Optional[AppendFile] = None
+
+        self._intrinsics: dict = {}
+        self._frame_count = 0
+        self._dropped = 0
+        self._first_ts: Optional[float] = None
+        self._last_ts: Optional[float] = None
         # Sliding-window frame timestamps for live fps reporting.
-        self._fps_window:  deque[float] = deque()
+        self._fps_window: deque = deque()
+        self._record_from = 0.0
+        self._gate = PauseGate()
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
-    def start(self):
+    def start(self, save_dir: Path, record_from: float = 0.0):
+        try:
+            self._start(save_dir, record_from)
+        except Exception:
+            self.stop()
+            raise
+
+    def _start(self, save_dir: Path, record_from: float = 0.0):
+        """Frames captured before `record_from` (Unix time) are discarded."""
         if self._running:
             return
+        if not self.mock and not REALSENSE_AVAILABLE:
+            raise RuntimeError("EgoRealSense: required driver is unavailable; mock mode must be explicit")
+        self._error = None
+        self._record_from = record_from
+        self._gate.reset()
+        cam_dir = Path(save_dir) / CAM_DIRNAME
+        cam_dir.mkdir(parents=True, exist_ok=True)
+
+        with self._lock:
+            self._frame_count = 0
+            self._dropped = 0
+            self._first_ts = None
+            self._last_ts = None
+            self._fps_window.clear()
+        self._queue = queue.Queue(maxsize=self._QUEUE_FRAMES)
+
+        if not self.mock:
+            self._pipeline = rs.pipeline()
+            config = rs.config()
+            if self.serial:
+                config.enable_device(self.serial)
+            config.enable_stream(
+                rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps
+            )
+            config.enable_stream(
+                rs.stream.depth, self.width, self.height, rs.format.z16, self.fps
+            )
+            self._profile = self._pipeline.start(config)
+            # Intrinsics don't change during streaming.
+            self._intrinsics = self._read_intrinsics(self._profile)
+            capture = self._capture_loop
+        else:
+            print(f"[EgoRealSense] Mock mode: synthetic frames at {self.fps} Hz")
+            self._intrinsics = self._mock_intrinsics()
+            capture = self._mock_loop
+
+        self._intrinsics["depth_native"] = dict(self._intrinsics["depth"])
+        self._intrinsics["depth"] = dict(
+            self._intrinsics["color"], depth_scale=self._intrinsics["depth_native"]["depth_scale"])
+        self._intrinsics["depth_aligned_to"] = "color"
+        self._intrinsics["mock"] = self.mock
+        (cam_dir / "intrinsics.json").write_text(json.dumps(self._intrinsics, indent=2))
+        self._rgb_file = AppendFile(cam_dir / RGB_FILENAME)
+        self._depth_file = AppendFile(cam_dir / DEPTH_FILENAME)
+        self._frames_file = AppendFile(cam_dir / FRAMES_FILENAME)
+
         self._running = True
-        self._clear_buffers()
-
-        if not REALSENSE_AVAILABLE:
-            self._start_mock()
-            return
-
-        self._pipeline = rs.pipeline()
-        config = rs.config()
-        if self.serial:
-            config.enable_device(self.serial)
-        config.enable_stream(
-            rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps
-        )
-        config.enable_stream(
-            rs.stream.depth, self.width, self.height, rs.format.z16, self.fps
-        )
-        self._profile = self._pipeline.start(config)
-
-        # Cache intrinsics once — they don't change during streaming.
-        self._intrinsics = self._read_intrinsics(self._profile)
-
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._writer_thread = threading.Thread(target=self._writer_guard, daemon=True)
+        self._writer_thread.start()
+        self._thread = threading.Thread(target=self._capture_guard, args=(capture,), daemon=True)
         self._thread.start()
         print(
             f"[EgoRealSense] Started {self._intrinsics['name']} "
@@ -125,93 +189,56 @@ class EgocentricCameraCollector:
             f"{self.width}x{self.height} @ {self.fps} fps"
         )
 
-    def stop(self):
+    def stop(self) -> dict:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
         if self._pipeline is not None:
             try:
                 self._pipeline.stop()
             except Exception:
                 pass
             self._pipeline = None
-        print(f"[EgoRealSense] Stopped. Buffered {len(self._timestamps)} frames.")
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        # The writer drains whatever is still queued before exiting.
+        if self._writer_thread is not None:
+            self._writer_thread.join()
+            self._writer_thread = None
+        for f in (self._rgb_file, self._depth_file, self._frames_file):
+            if f is not None:
+                try:
+                    f.close()
+                except Exception as exc:
+                    self._error = self._error or exc
+        self._rgb_file = self._depth_file = self._frames_file = None
 
-    def save(self, save_dir: Path):
-        """
-        Flush frames to <save_dir>/ego_cam/.
-
-        Returns a summary dict suitable for the daemon's stop() response.
-        """
-        save_dir = Path(save_dir)
-        cam_dir = save_dir / "ego_cam"
-        cam_dir.mkdir(parents=True, exist_ok=True)
-
-        with self._lock:
-            color_snap = list(self._color_frames)
-            depth_snap = list(self._depth_frames)
-            ts_snap    = list(self._timestamps)
-            intr_snap  = dict(self._intrinsics)
-
-        if not color_snap:
-            print("[EgoRealSense] No frames to save.")
-            return {"frames": 0}
-
-        n = len(color_snap)
-        timestamps = np.array(ts_snap, dtype=np.float64)
-        duration = float(timestamps[-1] - timestamps[0]) if n > 1 else 0.0
-        actual_fps = (n / duration) if duration > 0 else float(self.fps)
-
-        # intrinsics.json
-        (cam_dir / "intrinsics.json").write_text(json.dumps(intr_snap, indent=2))
-
-        # rgb.mp4 (declared fps initially; remuxed below if actual diverges)
-        mp4_path = cam_dir / "rgb.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            str(mp4_path), fourcc, float(self.fps), (self.width, self.height)
+        if self._error is not None:
+            raise RuntimeError(f"Camera writer failed: {self._error}") from self._error
+        n = self._frame_count
+        duration = (
+            float(self._last_ts - self._first_ts - self._gate.gap_within(self._first_ts, self._last_ts))
+            if n > 1 and self._first_ts is not None else 0.0
         )
-        for frame in color_snap:
-            writer.write(frame)
-        writer.release()
-
-        # rgb_timestamps.npy (per-frame host timestamps, shared with depth)
-        np.save(cam_dir / "rgb_timestamps.npy", timestamps)
-
-        # depth.npz — color-aligned uint16 depth frames + same timestamps
-        depth_array = np.stack(depth_snap, axis=0)   # (F, H, W) uint16
-        np.savez_compressed(
-            cam_dir / "depth.npz",
-            depth=depth_array,
-            timestamps=timestamps,
+        actual_fps = ((n - 1) / duration) if duration > 0 else 0.0
+        print(
+            f"[EgoRealSense] Stopped. {n} frames, {duration:.2f}s, "
+            f"~{actual_fps:.1f} fps, {self._dropped} dropped"
         )
-
-        # Optional: fix MP4 fps metadata if actual differs from declared.
-        mp4_fps_fixed = False
-        if (
-            self.fps > 0
-            and n > 1
-            and abs(actual_fps - self.fps) / self.fps > self.FPS_FIX_THRESHOLD
-        ):
-            mp4_fps_fixed = self._remux_mp4_fps(mp4_path, actual_fps)
-
-        info = {
+        return {
             "frames":         n,
             "duration_s":     round(duration, 2),
             "actual_fps":     round(actual_fps, 2),
             "target_fps":     self.fps,
-            "mp4_fps_fixed":  mp4_fps_fixed,
+            "dropped_frames": self._dropped,
         }
-        print(
-            f"[EgoRealSense] Saved {n} frames, {duration:.2f}s, "
-            f"~{actual_fps:.1f} fps → {cam_dir}"
-        )
-        return info
 
     @property
     def frame_count(self) -> int:
-        return len(self._timestamps)
+        return self._frame_count
+
+    @property
+    def dropped_frames(self) -> int:
+        return self._dropped
 
     @property
     def recent_fps(self) -> float:
@@ -226,9 +253,23 @@ class EgocentricCameraCollector:
             count = len(self._fps_window)
         return float(count) / self._FPS_WINDOW_S
 
+    def pause(self):
+        """Drop data until resume(); files stay open."""
+        self._gate.pause(time.time())
+
+    def resume(self):
+        self._gate.resume(time.time())
+
     # ------------------------------------------------------------------
     # Capture loop
     # ------------------------------------------------------------------
+
+    def _capture_guard(self, capture):
+        try:
+            capture()
+        except Exception as exc:
+            self._error = exc
+            print(f"[EgoRealSense] Capture failed: {exc}")
 
     def _capture_loop(self):
         align = rs.align(rs.stream.color)
@@ -254,16 +295,64 @@ class EgocentricCameraCollector:
             # Must .copy() — the underlying RealSense buffers get recycled.
             color_np = np.asanyarray(color_f.get_data()).copy()
             depth_np = np.asanyarray(depth_f.get_data()).copy()
+            self._enqueue(ts, color_np, depth_np)
 
-            with self._lock:
-                self._color_frames.append(color_np)
-                self._depth_frames.append(depth_np)
-                self._timestamps.append(ts)
-                # Update sliding-window live fps.
-                cutoff = ts - self._FPS_WINDOW_S
-                while self._fps_window and self._fps_window[0] < cutoff:
-                    self._fps_window.popleft()
-                self._fps_window.append(ts)
+    def _enqueue(self, ts: float, color: np.ndarray, depth: np.ndarray):
+        if not self._running or self._error is not None:
+            return
+        with self._lock:
+            # Update sliding-window live fps.
+            cutoff = ts - self._FPS_WINDOW_S
+            while self._fps_window and self._fps_window[0] < cutoff:
+                self._fps_window.popleft()
+            self._fps_window.append(ts)
+        if ts < self._record_from or self._gate.paused:
+            return
+        try:
+            self._queue.put_nowait((ts, color, depth))
+        except queue.Full:
+            self._dropped += 1
+            if self._dropped == 1:
+                print("[EgoRealSense] Disk writer is behind — dropping frames.")
+
+    # ------------------------------------------------------------------
+    # Disk writer
+    # ------------------------------------------------------------------
+
+    def _writer_guard(self):
+        try:
+            self._writer_loop()
+        except Exception as exc:
+            self._error = exc
+            print(f"[Collector] Disk writer failed: {exc}")
+
+    def _writer_loop(self):
+        while self._running or not self._queue.empty():
+            try:
+                ts, color, depth = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            ok, jpeg = cv2.imencode(
+                ".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+            )
+            if not ok:
+                self._dropped += 1
+                continue
+            jpeg = jpeg.tobytes()
+
+            # Append the index after the payloads. Separate fsync calls do not
+            # guarantee crash ordering; conversion validates each payload.
+            offset = self._rgb_file.bytes_written
+            self._rgb_file.write(jpeg)
+            self._depth_file.write(np.ascontiguousarray(depth, dtype="<u2").tobytes())
+            record = np.array([(ts, offset, len(jpeg))], dtype=FRAME_DTYPE)
+            self._frames_file.write(record.tobytes())
+
+            self._frame_count += 1
+            if self._first_ts is None:
+                self._first_ts = ts
+            self._last_ts = ts
 
     # ------------------------------------------------------------------
     # Helpers
@@ -297,68 +386,24 @@ class EgocentricCameraCollector:
             "name":   device.get_info(rs.camera_info.name),
         }
 
-    @staticmethod
-    def _remux_mp4_fps(mp4_path: Path, fps: float) -> bool:
-        """Rewrite MP4 frame-rate metadata with ffmpeg (-c copy, no re-encode)."""
-        tmp = mp4_path.with_suffix(".fps_fix.mp4")
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y",
-                 "-r", f"{fps:.4f}",
-                 "-i", str(mp4_path),
-                 "-c", "copy",
-                 str(tmp)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            tmp.replace(mp4_path)
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"[EgoRealSense] ffmpeg remux failed ({e}); keeping original rgb.mp4.")
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except Exception:
-                    pass
-            return False
-
-    def _clear_buffers(self):
-        with self._lock:
-            self._color_frames = []
-            self._depth_frames = []
-            self._timestamps = []
-            self._intrinsics = {}
-            self._fps_window.clear()
-
     # ------------------------------------------------------------------
     # Mock mode (no camera / running on laptop for dev)
     # ------------------------------------------------------------------
 
-    def _start_mock(self):
-        print(f"[EgoRealSense] Mock mode: synthetic frames at {self.fps} Hz")
-        # Pre-fill mock intrinsics so save() produces a valid intrinsics.json.
-        self._intrinsics = {
-            "color": {
-                "width": self.width, "height": self.height,
-                "fx": 600.0, "fy": 600.0,
-                "ppx": self.width / 2, "ppy": self.height / 2,
-                "distortion_model": "Brown Conrady",
-                "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
-            },
-            "depth": {
-                "width": self.width, "height": self.height,
-                "fx": 600.0, "fy": 600.0,
-                "ppx": self.width / 2, "ppy": self.height / 2,
-                "distortion_model": "Brown Conrady",
-                "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
-                "depth_scale": 0.001,
-            },
+    def _mock_intrinsics(self) -> dict:
+        intr = {
+            "width": self.width, "height": self.height,
+            "fx": 600.0, "fy": 600.0,
+            "ppx": self.width / 2, "ppy": self.height / 2,
+            "distortion_model": "Brown Conrady",
+            "coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+        }
+        return {
+            "color": dict(intr),
+            "depth": dict(intr, depth_scale=0.001),
             "serial": "MOCK-EGO-0000",
             "name":   "Mock Ego RealSense",
         }
-        self._thread = threading.Thread(target=self._mock_loop, daemon=True)
-        self._thread.start()
 
     def _mock_loop(self):
         interval = 1.0 / self.fps
@@ -377,15 +422,7 @@ class EgocentricCameraCollector:
                 np.linspace(500, 3000, self.width, dtype=np.uint16),
                 (self.height, 1),
             )
-
-            with self._lock:
-                self._color_frames.append(color)
-                self._depth_frames.append(depth)
-                self._timestamps.append(ts)
-                cutoff = ts - self._FPS_WINDOW_S
-                while self._fps_window and self._fps_window[0] < cutoff:
-                    self._fps_window.popleft()
-                self._fps_window.append(ts)
+            self._enqueue(ts, color, depth)
             idx += 1
 
             time.sleep(max(0.0, interval - (time.monotonic() - t0)))

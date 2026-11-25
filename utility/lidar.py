@@ -2,32 +2,38 @@
 lidar.py — Collect 4D LiDAR L1 point clouds from Go2 EDU.
 
 Subscribes to rt/utlidar/cloud (sensor_msgs::PointCloud2) over DDS and
-buffers each scan in memory. On save() writes one .npy per scan plus a
-JSON sidecar with the original field layout.
+writes each scan to disk as it arrives:
 
-Native rate for the Go2 L1 is ~11 Hz scans (~21,600 pts/s), so at ~11 Hz
-each scan has ~2,000 points. The collector does not rate-limit — it
-consumes every scan the DDS topic publishes.
+    <save_dir>/lidar/000000.npy, 000001.npy, ...   per-scan (N, 4) float32
+    <save_dir>/lidar_timestamps.bin                float64 host timestamps
+    <save_dir>/lidar_meta.json                     topic, frame_id, field layout
+
+scripts/finalize_session.py turns lidar_timestamps.bin into
+lidar_timestamps.npy offline.
+
+DDS message rate depends on the active LiDAR and publishing configuration.
+The collector does not rate-limit; its mock stream generates 11 scans/s.
 
 Usage:
     from utility.lidar import LidarCollector
 
     collector = LidarCollector(network_interface="eth0")
-    collector.start()
+    collector.start(Path("data/task1/session/first_person"))
     # ... robot is moving ...
     collector.stop()
-    collector.save(Path("data/task1/session/robot"))
 """
 
 import json
+import os
+import queue
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from .streaming import AppendFile, PauseGate, RateMeter
 
 try:
     from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -35,13 +41,17 @@ try:
     SDK_AVAILABLE = True
 except ImportError:
     SDK_AVAILABLE = False
-    print("[LidarCollector] WARNING: unitree_sdk2py not found — running in mock mode")
+    print("[LidarCollector] WARNING: unitree_sdk2py not found — real recording unavailable")
 
 
-# Go2 EDU 4D LiDAR L1 native scan rate (hardware maximum).
-# Source: Unitree 4D LiDAR-L1 User Manual v1.1 — 方位 11 Hz, 采样 21,600 pts/s.
+# Synthetic scan rate only; not a limit on the live DDS topic.
 NATIVE_SCAN_HZ = 11
 LIDAR_TOPIC_DEFAULT = "rt/utlidar/cloud"
+
+SCAN_DIRNAME = "lidar"
+TIMESTAMPS_RAW_FILENAME = "lidar_timestamps.bin"
+META_FILENAME = "lidar_meta.json"
+PER_SCAN_FORMAT = "(N, 4) float32: [x, y, z, intensity]"
 
 
 # sensor_msgs::PointField datatype codes → numpy dtypes
@@ -62,122 +72,154 @@ _PF_NUMPY = {
 }
 
 
-@dataclass
-class _ParsedScan:
-    timestamp: float         # host clock (time.time())
-    points: np.ndarray       # (N, 4) float32: [x, y, z, intensity]
-
-
 class LidarCollector:
     """
-    Subscribes to rt/utlidar/cloud and buffers point clouds in memory.
+    Subscribes to rt/utlidar/cloud and streams point clouds to disk.
 
     Each scan is parsed to (N, 4) float32 [x, y, z, intensity] on arrival.
     If the DDS message has no 'intensity' field, the 4th column is zeros.
     """
 
+    # Scans waiting for the disk writer (~10 s at the native rate).
+    _QUEUE_SCANS = 128
+
     def __init__(
         self,
         network_interface: str = "eth0",
         topic: str = LIDAR_TOPIC_DEFAULT,
+        mock: bool = False,
     ):
         self.network_interface = network_interface
+        self.mock = mock
+        self._error = None
         self.topic = topic
 
         self._lock = threading.Lock()
         self._running = False
         self._subscriber: Optional["ChannelSubscriber"] = None
         self._mock_thread: Optional[threading.Thread] = None
+        self._writer_thread: Optional[threading.Thread] = None
+        self._queue: "queue.Queue" = queue.Queue(maxsize=self._QUEUE_SCANS)
 
-        self._scans: deque[_ParsedScan] = deque()
+        self._save_dir: Optional[Path] = None
+        self._ts_file: Optional[AppendFile] = None
         self._frame_id: Optional[str] = None
-        self._field_layout: Optional[list[dict]] = None
+        self._field_layout: Optional[list] = None
+        self._meta_written = False
         self._parse_errors: int = 0
+        self._dropped: int = 0
+        self._scan_count: int = 0
+        self._points_total: int = 0
+        self._first_ts: Optional[float] = None
+        self._last_ts: Optional[float] = None
+        self._rate = RateMeter()
+        self._record_from = 0.0
+        self._gate = PauseGate()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def start(self):
+    def start(self, save_dir: Path, record_from: float = 0.0):
+        """Scans that arrive before `record_from` (Unix time) are discarded."""
         if self._running:
             return
-        self._running = True
-        self._clear_buffers()
+        if not self.mock and not SDK_AVAILABLE:
+            raise RuntimeError("LidarCollector: required driver is unavailable; mock mode must be explicit")
+        self._error = None
+        self._record_from = record_from
+        self._gate.reset()
+        self._save_dir = Path(save_dir)
+        (self._save_dir / SCAN_DIRNAME).mkdir(parents=True, exist_ok=True)
 
-        if not SDK_AVAILABLE:
+        with self._lock:
+            self._frame_id = None
+            self._field_layout = None
+        self._meta_written = False
+        self._parse_errors = 0
+        self._dropped = 0
+        self._scan_count = 0
+        self._points_total = 0
+        self._first_ts = None
+        self._last_ts = None
+        self._rate.reset()
+        self._queue = queue.Queue(maxsize=self._QUEUE_SCANS)
+        self._ts_file = AppendFile(self._save_dir / TIMESTAMPS_RAW_FILENAME)
+
+        self._running = True
+        self._writer_thread = threading.Thread(target=self._writer_guard, daemon=True)
+        self._writer_thread.start()
+
+        if self.mock:
             self._start_mock()
             return
 
-        self._subscriber = ChannelSubscriber(self.topic, PointCloud2_)
-        self._subscriber.Init(self._on_cloud, 5)
-        print(f"[LidarCollector] Subscribed to {self.topic} on {self.network_interface}")
+        # Subscribe once and keep it for the life of the process (the callback
+        # ignores messages while not recording). Subscribing again on every
+        # start() would deliver each scan once per subscriber.
+        if self._subscriber is None:
+            subscriber = ChannelSubscriber(self.topic, PointCloud2_)
+            subscriber.Init(self._on_cloud, 5)
+            self._subscriber = subscriber
+            print(f"[LidarCollector] Subscribed to {self.topic} on {self.network_interface}")
 
-    def stop(self):
-        self._running = False
-        if self._mock_thread is not None:
-            self._mock_thread.join(timeout=2.0)
-            self._mock_thread = None
-        print(
-            f"[LidarCollector] Stopped. Buffered {len(self._scans)} scans "
-            f"(parse errors: {self._parse_errors})."
-        )
-
-    def save(self, save_dir: Path):
-        """
-        Flush buffered scans to disk.
-
-        Outputs (under save_dir):
-            lidar/000000.npy, 000001.npy, ...   per-scan (N, 4) float32
-            lidar_timestamps.npy                 (M,) float64 host timestamps
-            lidar_meta.json                      topic, frame_id, field layout
-        """
-        save_dir = Path(save_dir)
-        lidar_dir = save_dir / "lidar"
-        lidar_dir.mkdir(parents=True, exist_ok=True)
-
-        with self._lock:
-            scans_snapshot = list(self._scans)
-            frame_id = self._frame_id
-            fields = self._field_layout
-
-        if not scans_snapshot:
-            print("[LidarCollector] No scans to save.")
+    def stop(self) -> dict:
+        if not self._running:
             return {"scans": 0}
+        with self._lock:
+            self._running = False
+        if self._mock_thread is not None:
+            self._mock_thread.join()
+            self._mock_thread = None
+        # The writer drains whatever is still queued before exiting.
+        if self._writer_thread is not None:
+            self._writer_thread.join()
+            self._writer_thread = None
+        if self._ts_file is not None:
+            try:
+                self._ts_file.close()
+            except Exception as exc:
+                self._error = self._error or exc
+            self._ts_file = None
+        self._write_meta()
 
-        for i, scan in enumerate(scans_snapshot):
-            np.save(lidar_dir / f"{i:06d}.npy", scan.points)
-
-        timestamps = np.array([s.timestamp for s in scans_snapshot], dtype=np.float64)
-        np.save(save_dir / "lidar_timestamps.npy", timestamps)
-
-        meta = {
-            "topic": self.topic,
-            "frame_id": frame_id,
-            "fields": fields,
-            "num_scans": len(scans_snapshot),
-            "per_scan_format": "(N, 4) float32: [x, y, z, intensity]",
-            "parse_errors": self._parse_errors,
-        }
-        (save_dir / "lidar_meta.json").write_text(json.dumps(meta, indent=2))
-
-        n = len(scans_snapshot)
-        duration = round(float(timestamps[-1] - timestamps[0]), 2) if n > 1 else 0.0
-        actual_hz = round(n / duration, 1) if duration > 0 else 0.0
-        avg_points = int(np.mean([len(s.points) for s in scans_snapshot]))
+        if self._error is not None:
+            raise RuntimeError(f"Disk writer failed: {self._error}") from self._error
+        n = self._scan_count
+        duration = (
+            round(self._last_ts - self._first_ts - self._gate.gap_within(self._first_ts, self._last_ts), 2)
+            if n > 1 and self._first_ts is not None else 0.0
+        )
+        actual_hz = round((n - 1) / duration, 1) if duration > 0 else 0.0
+        avg_points = int(self._points_total / n) if n else 0
         print(
-            f"[LidarCollector] Saved {n} scans, {duration}s, ~{actual_hz} Hz, "
-            f"avg {avg_points} pts/scan → {save_dir}"
+            f"[LidarCollector] Stopped. {n} scans, {duration}s, ~{actual_hz} Hz, "
+            f"avg {avg_points} pts/scan (parse errors: {self._parse_errors}, "
+            f"dropped: {self._dropped})"
         )
         return {
             "scans": n,
             "duration_s": duration,
             "hz": actual_hz,
             "avg_points_per_scan": avg_points,
+            "dropped_scans": self._dropped,
         }
 
     @property
     def scan_count(self) -> int:
-        return len(self._scans)
+        return self._scan_count
+
+    @property
+    def recent_hz(self) -> float:
+        """Scans received in the last second. Zero when not recording."""
+        return self._rate.hz() if self._running else 0.0
+
+    def pause(self):
+        """Drop data until resume(); files stay open."""
+        self._gate.pause(time.time())
+
+    def resume(self):
+        self._gate.resume(time.time())
 
     # ------------------------------------------------------------------
     # DDS callback
@@ -209,7 +251,74 @@ class LidarCollector:
                     }
                     for f in msg.fields
                 ]
-            self._scans.append(_ParsedScan(timestamp=ts, points=points))
+        self._enqueue(ts, points)
+
+    def _enqueue(self, ts: float, points: np.ndarray):
+        self._rate.tick(ts)
+        if ts < self._record_from or self._gate.paused:
+            return
+        with self._lock:
+            if not self._running or self._error is not None:
+                return
+            self._put_scan(ts, points)
+
+    def _put_scan(self, ts, points):
+        try:
+            self._queue.put_nowait((ts, points))
+        except queue.Full:
+            self._dropped += 1
+            if self._dropped == 1:
+                print("[LidarCollector] Disk writer is behind — dropping scans.")
+
+    # ------------------------------------------------------------------
+    # Disk writer
+    # ------------------------------------------------------------------
+
+    def _writer_guard(self):
+        try:
+            self._writer_loop()
+        except Exception as exc:
+            self._error = exc
+            print(f"[Collector] Disk writer failed: {exc}")
+
+    def _writer_loop(self):
+        scan_dir = self._save_dir / SCAN_DIRNAME
+        while self._running or not self._queue.empty():
+            try:
+                ts, points = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            # Scan file first, timestamp second: a timestamp on disk means
+            # its scan file was written before it.
+            with open(scan_dir / f"{self._scan_count:06d}.npy", "wb") as f:
+                np.save(f, points)
+                f.flush()
+                os.fsync(f.fileno())
+            self._ts_file.write(np.float64(ts).tobytes())
+
+            if not self._meta_written:
+                self._write_meta()
+                self._meta_written = True
+            self._scan_count += 1
+            self._points_total += len(points)
+            if self._first_ts is None:
+                self._first_ts = ts
+            self._last_ts = ts
+
+    def _write_meta(self):
+        with self._lock:
+            frame_id = self._frame_id
+            fields = self._field_layout
+        meta = {
+            "topic": self.topic,
+            "frame_id": frame_id,
+            "fields": fields,
+            "num_scans": self._scan_count,
+            "per_scan_format": PER_SCAN_FORMAT,
+            "parse_errors": self._parse_errors,
+        }
+        (self._save_dir / META_FILENAME).write_text(json.dumps(meta, indent=2))
 
     # ------------------------------------------------------------------
     # PointCloud2 parser — generic, follows the message's fields layout
@@ -244,7 +353,7 @@ class LidarCollector:
             if name in names:
                 continue        # guard against duplicates
             names.append(name)
-            formats.append(dtype)
+            formats.append(np.dtype(dtype).newbyteorder(">" if msg.is_bigendian else "<"))
             offsets.append(int(f.offset))
 
         if not {"x", "y", "z"}.issubset(names):
@@ -254,7 +363,12 @@ class LidarCollector:
             {"names": names, "formats": formats, "offsets": offsets,
              "itemsize": point_step}
         )
-        arr = np.frombuffer(raw, dtype=struct_dtype, count=num_points)
+        width, height = int(msg.width), int(msg.height)
+        row_step = int(msg.row_step)
+        if row_step < width * point_step or len(raw) < row_step * height:
+            raise ValueError("Invalid PointCloud2 row_step or truncated data")
+        arr = np.ndarray((height, width), dtype=struct_dtype, buffer=raw,
+                         strides=(row_step, point_step)).reshape(-1)
 
         x = arr["x"].astype(np.float32, copy=False)
         y = arr["y"].astype(np.float32, copy=False)
@@ -287,13 +401,5 @@ class LidarCollector:
             pts[:, 1] = rng.normal(0.0, 2.0, n)
             pts[:, 2] = rng.normal(0.0, 0.5, n)
             pts[:, 3] = rng.uniform(0.0, 100.0, n)
-            with self._lock:
-                self._scans.append(_ParsedScan(timestamp=ts, points=pts))
+            self._enqueue(ts, pts)
             time.sleep(max(0.0, interval - (time.monotonic() - t0)))
-
-    def _clear_buffers(self):
-        with self._lock:
-            self._scans.clear()
-            self._frame_id = None
-            self._field_layout = None
-            self._parse_errors = 0

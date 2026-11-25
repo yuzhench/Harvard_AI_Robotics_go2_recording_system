@@ -10,8 +10,8 @@ Controls:
     Q   →   Quit
 
 Usage:
-    python laptop_side_code/remote_control_client.py
-    python laptop_side_code/remote_control_client.py --host 192.168.123.18 --port 9876
+    python laptop/remote_control_client.py
+    python laptop/remote_control_client.py --host 192.168.123.18 --port 9876
 """
 
 import sys

@@ -1,6 +1,6 @@
 [Unit]
 Description=Go2 Record Daemon (FastAPI)
-After=network-online.target
+After=network-online.target go2-clock-restore.service
 Wants=network-online.target
 
 [Service]
