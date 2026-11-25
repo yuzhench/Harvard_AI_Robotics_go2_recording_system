@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from jetson.screen_link import (  # noqa: E402
-    NOMINAL_HZ, SENSORS, ScreenLink, SensorHealth, format_status,
+    NOMINAL_HZ, SENSORS, ScreenLink, SensorHealth, format_clock, format_status,
 )
 
 SEND_HZ = 5.0
@@ -93,6 +93,8 @@ def main():
                         help=f"make one of {SENSORS} drop to 0 Hz this long into a recording")
     parser.add_argument("--recover", type=float, default=None, metavar="SECONDS",
                         help="seconds after the drop at which the sensor comes back")
+    parser.add_argument("--clock-not-set", action="store_true",
+                        help="report the Jetson clock as not set (CLOCK NOT SET on the idle page)")
     parser.add_argument("--autostart", action="store_true",
                         help="begin recording without waiting for the screen")
     parser.add_argument("--duration", type=float, default=None,
@@ -140,6 +142,7 @@ def main():
                 hz, ok = None, None
 
             link.send(format_status(rec.screen_state, rec.elapsed, used_pct, free_gb, hz, ok))
+            link.send(format_clock(not args.clock_not_set))
             time.sleep(1.0 / SEND_HZ)
     except KeyboardInterrupt:
         pass

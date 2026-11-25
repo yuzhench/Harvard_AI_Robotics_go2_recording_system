@@ -13,7 +13,8 @@ the robot's Ethernet port:
     POST /sessions/mark_exported        remember that a session was copied and verified
     POST /sessions/delete               delete sessions
     POST /export/state                  the tool's phase + progress, shown on the screen
-    POST /time                          set the Jetson clock from the laptop
+    POST /time                          set the Jetson clock from the laptop (and correct the recordings made
+                                        before it in this boot, see clock.py)
 
 A session id is its path relative to DATA_ROOT, e.g.
 "unlabeled/10_05_2026/21_40_39".
@@ -38,6 +39,7 @@ from utility.egocentric_camera import (
     CAM_DIRNAME, FRAME_DTYPE, FRAMES_FILENAME, RGB_FILENAME,
 )
 
+from . import clock
 from .config import DATA_ROOT
 from .recorder import SESSION_META_FILENAME
 
@@ -342,7 +344,7 @@ def set_time(req: TimeRequest):
     jetson/install_offload_support.sh."""
     offset = req.unix_time - time.time()
     if abs(offset) <= CLOCK_TOLERANCE_S:
-        return {"status": "unchanged", "offset_s": round(offset, 3)}
+        return dict(_clock_now_right(), status="unchanged", offset_s=round(offset, 3))
     if _is_recording() is not None:
         # Stepping the clock mid-recording would break the timestamps.
         return {"status": "skipped", "offset_s": round(offset, 3), "detail": "recording in progress"}
@@ -354,4 +356,14 @@ def set_time(req: TimeRequest):
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
         detail = getattr(e, "stderr", "") or str(e)
         return {"status": "failed", "offset_s": round(offset, 3), "detail": detail.strip()}
-    return {"status": "set", "offset_s": round(offset, 3)}
+    return dict(_clock_now_right(), status="set", offset_s=round(offset, 3))
+
+
+def _clock_now_right() -> Dict:
+    """The clock is right (just set, or already within tolerance): remember it for this boot and correct the
+    recordings made before it (clock.py). Never fails the request."""
+    try:
+        clock.mark_trusted("laptop")
+        return {"corrected": clock.correct_sessions(_data_root, skip=_is_recording())}
+    except Exception as e:
+        return {"corrected": [], "correction_error": str(e)}

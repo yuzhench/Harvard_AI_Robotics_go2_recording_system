@@ -18,6 +18,27 @@ from utility.imu import IMUCollector, LOWSTATE_DTYPE
 from utility.lidar import LidarCollector
 from scripts.finalize_session import finalize, finalize_ego_cam, finalize_lidar
 
+# No test may ask this computer's chrony or write the real clock state in /dev/shm (jetson/clock.py).
+from jetson import clock as _clock_module
+_REAL_CHRONY_SYNCED = _clock_module.chrony_synced        # tested on its own with a fake chronyc
+_clock_tmp = tempfile.TemporaryDirectory()
+_clock_patches = []
+
+
+def setUpModule():
+    from jetson import clock
+    _clock_patches.extend([patch.object(clock, 'STATE_PATH', Path(_clock_tmp.name) / 'clock.json'),
+                           patch.object(clock, 'chrony_synced', return_value=False)])
+    for p in _clock_patches:
+        p.start()
+
+
+def tearDownModule():
+    for p in _clock_patches:
+        p.stop()
+    _clock_tmp.cleanup()
+
+
 class RecordingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -400,3 +421,119 @@ class MasterTests(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()
 
+
+class ClockTests(unittest.TestCase):
+    """jetson/clock.py: is the clock set, and correcting recordings made before it was."""
+
+    def setUp(self):
+        from jetson import clock
+        self.clock = clock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / 'data'
+        self.patches = [patch.object(clock, 'STATE_PATH', Path(self.tmp.name) / 'clock.json'),
+                        patch.object(clock, 'chrony_synced', return_value=False)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def session(self, rel, clock_entry, start=1793300000.0):
+        fp = self.root / rel / 'first_person'
+        fp.mkdir(parents=True)
+        (fp / 'session_meta.json').write_text(json.dumps({'task': 'walk', 'start_time': start, 'clock': clock_entry}))
+        return fp
+
+    def test_recording_stores_whether_the_clock_was_set(self):
+        recorder = Recorder(data_root=str(self.root), mock=True)
+        recorder.ego = EgocentricCameraCollector(width=64, height=48, mock=True)
+        with patch('jetson.recorder.START_DELAY_S', 0):
+            path = recorder.start('task1')
+            self.assertFalse(json.loads((path / 'session_meta.json').read_text())['clock']['trusted'])
+            time.sleep(0.1)
+            recorder.stop()
+        c = json.loads((path / 'session_meta.json').read_text())['clock']
+        self.assertEqual(c['boot_id'], self.clock.boot_id())
+        self.assertAlmostEqual(c['boot_epoch'], self.clock.boot_epoch(), delta=1.0)
+        self.assertFalse(c['trusted'])
+
+    def test_recordings_of_this_boot_get_the_offset_once_the_clock_is_set(self):
+        c, here = self.clock, self.clock.boot_id()
+        wrong = c.boot_epoch()
+        early = self.session('walk/11_06_2026/10_00_00', {'boot_id': here, 'boot_epoch': wrong, 'trusted': False})
+        other_boot = self.session('walk/11_06_2026/09_00_00', {'boot_id': 'another', 'boot_epoch': wrong, 'trusted': False})
+        fine = self.session('walk/11_24_2026/10_00_00', {'boot_id': here, 'boot_epoch': wrong, 'trusted': True})
+        recording = self.session('walk/11_06_2026/10_30_00', {'boot_id': here, 'boot_epoch': wrong, 'trusted': False})
+        old = self.session('walk/10_01_2026/10_00_00', None)
+        self.assertEqual(c.correct_sessions(self.root), [], 'nothing while the clock is not set')
+        self.assertFalse(c.trusted())
+        with patch.object(c, 'boot_epoch', return_value=wrong + 1468800.25):   # the laptop moved the clock 17 days on
+            self.assertTrue(c.mark_trusted('laptop'))
+            self.assertFalse(c.mark_trusted('laptop'))
+            done = c.correct_sessions(self.root, skip=recording)
+        self.assertTrue(c.trusted())
+        self.assertEqual(done, ['walk/11_06_2026/10_00_00'])
+        fix = json.loads((early / 'clock_correction.json').read_text())
+        self.assertAlmostEqual(fix['offset_s'], 1468800.25, places=2)
+        self.assertAlmostEqual(fix['start_time'], 1793300000.0 + 1468800.25, places=2)
+        self.assertEqual(fix['source'], 'laptop')
+        for fp in (other_boot, fine, recording, old):
+            self.assertFalse((fp / 'clock_correction.json').exists())
+        before = (early / 'clock_correction.json').read_text()
+        self.assertEqual(c.correct_sessions(self.root), ['walk/11_06_2026/10_30_00'], 'the one recording then, after it stopped')
+        self.assertEqual((early / 'clock_correction.json').read_text(), before, 'an existing correction is not rewritten')
+        self.assertEqual(json.loads((early / 'session_meta.json').read_text())['start_time'], 1793300000.0,
+                         'the recording itself is not changed')
+
+    def test_time_endpoint_sets_the_clock_and_corrects(self):
+        from jetson import export_api as api
+        c = self.clock
+        wrong = c.boot_epoch()
+        early = self.session('walk/11_06_2026/10_00_00', {'boot_id': c.boot_id(), 'boot_epoch': wrong, 'trusted': False})
+        api.configure(str(self.root), lambda: None)
+        with patch.object(api.subprocess, 'run') as run, patch.object(c, 'boot_epoch', return_value=wrong + 600.0):
+            out = api.set_time(api.TimeRequest(unix_time=time.time() + 600.0))
+        self.assertEqual(out['status'], 'set')
+        self.assertIn('date', run.call_args[0][0][2])
+        self.assertEqual(out['corrected'], ['walk/11_06_2026/10_00_00'])
+        self.assertAlmostEqual(json.loads((early / 'clock_correction.json').read_text())['offset_s'], 600.0, places=2)
+        self.assertTrue(c.trusted())
+
+    def test_time_endpoint_within_tolerance_still_counts_as_set(self):
+        from jetson import export_api as api
+        api.configure(str(self.root), lambda: None)
+        with patch.object(api.subprocess, 'run') as run:
+            out = api.set_time(api.TimeRequest(unix_time=time.time()))
+        self.assertEqual(out['status'], 'unchanged')
+        run.assert_not_called()
+        self.assertTrue(self.clock.trusted())
+
+    def test_chrony_counts_only_when_synchronised_to_a_real_source(self):
+        c = self.clock
+        try:
+            for out, expect in (('Reference ID    : 0A64CF0C (10.100.207.12)\nLeap status     : Normal\n', True),
+                                ('Reference ID    : 7F7F0101 ()\nLeap status     : Normal\n', False),
+                                ('Reference ID    : 00000000 ()\nLeap status     : Not synchronised\n', False)):
+                c._chrony_cache['t'] = -1e9
+                with self.subTest(out=out), patch.object(c.subprocess, 'run', return_value=SimpleNamespace(stdout=out)):
+                    self.assertEqual(_REAL_CHRONY_SYNCED(), expect)
+            c._chrony_cache['t'] = -1e9
+            with patch.object(c.subprocess, 'run', side_effect=FileNotFoundError):
+                self.assertFalse(_REAL_CHRONY_SYNCED())
+        finally:
+            c._chrony_cache['t'] = -1e9
+
+    def test_screen_clock_line(self):
+        from jetson.screen_link import format_clock
+        self.assertEqual(format_clock(False), '$C,0\n')
+        self.assertEqual(format_clock(True), '$C,1\n')
+
+    def test_a_failing_correction_never_breaks_stop(self):
+        from jetson import record_daemon as daemon
+        from unittest.mock import Mock
+        recorder = Mock()
+        recorder.stop.return_value = {'session_dir': 'x', 'elapsed_seconds': 1.0, 'samples': {}}
+        with patch.object(daemon, '_recorder', recorder), patch.object(self.clock, 'correct_sessions', side_effect=OSError('disk')):
+            self.assertEqual(daemon.stop()['status'], 'stopped')

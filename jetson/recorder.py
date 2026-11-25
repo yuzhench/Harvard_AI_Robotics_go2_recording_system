@@ -34,6 +34,7 @@ from utility.imu import IMUCollector
 from utility.egocentric_camera import EgocentricCameraCollector
 from utility.lidar import LidarCollector
 
+from . import clock
 from .config import DATA_ROOT, INTERFACE, SCREEN_TASK, START_DELAY_S, TASKS
 
 SESSION_META_FILENAME = "session_meta.json"
@@ -192,6 +193,7 @@ class Recorder:
             self._start_ts = record_from
             self._paused_at = None
             self._pauses = []
+            self._clock = clock.stamp()                 # is the clock right? (clock.py)
             self._state = "recording"
 
         # Keep the operation lock while collectors start; the state lock is free.
@@ -200,7 +202,7 @@ class Recorder:
         try:
             self._write_meta(session_dir, {
                 "task": task, "prompt": prompt, "start_time": record_from,
-                "clean_stop": False, "mock": self.mock,
+                "clean_stop": False, "mock": self.mock, "clock": self._clock,
             })
             self.imu.start(session_dir, record_from)
             self.ego.start(session_dir, record_from)
@@ -260,6 +262,7 @@ class Recorder:
             start_ts = self._start_ts
             elapsed = self.elapsed
             pauses = [list(p) for p in self._pauses]
+            clock_stamp = self._clock
             if self._paused_at is not None:          # stopped while paused
                 pauses.append([self._paused_at, time.time()])
             # "saving" covers the writer threads draining their queues.
@@ -279,6 +282,7 @@ class Recorder:
                 "collectors":      info,
                 "clean_stop":      not errors,
                 "mock":            self.mock,
+                "clock":           clock_stamp,
             })
         finally:
             self._reset()

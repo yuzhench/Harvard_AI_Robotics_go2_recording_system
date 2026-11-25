@@ -8,12 +8,16 @@ start / stop; double tap while recording: pause / resume):
     host -> screen   $S,<state>,<elapsed_s>,<disk_used_pct>,<disk_free_gb>,
                         <hz0>,<ok0>, ... ,<hz4>,<ok4>\\n
                      $X,<phase>,<progress>,<current>,<total>\\n
+                     $C,<clock_set>\\n
     screen -> host   $E,START\\n   $E,STOP\\n   $E,PAUSE\\n   $E,RESUME\\n
 
 <state> is STATE_CODES below; "paused" is a recording that keeps no data.
 
 "$X" carries the offload tool's progress (see export_api.py) while a laptop
 is copying sessions off the robot; phase 0 means no laptop is attached.
+
+"$C" says whether the Jetson's clock has been set since it was switched on (clock.py); while it is 0 the
+screen shows CLOCK NOT SET on its idle page. Older firmware ignores the line.
 
 Sensor order is SENSORS below. The screen holds no thresholds of its own —
 "is this stream healthy" is decided here by SensorHealth and sent as <ok>.
@@ -115,6 +119,11 @@ def format_export(phase: str, progress: float, current: int, total: int) -> str:
     return "$X,%d,%d,%d,%d\n" % (
         EXPORT_PHASE_CODES[phase], int(round(progress)), int(current), int(total),
     )
+
+
+def format_clock(clock_set: bool) -> str:
+    """Build one clock line for the screen."""
+    return "$C,%d\n" % (1 if clock_set else 0)
 
 
 class ScreenLink:

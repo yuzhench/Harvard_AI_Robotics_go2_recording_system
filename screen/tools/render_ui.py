@@ -87,7 +87,7 @@ def frange(a, b, step):
 
 
 def render(state, linked=True, elapsed=0, disk_pct=42, free_gb=128,
-           hz=None, ok=None, alarm_phase=False, hold=None, export=None):
+           hz=None, ok=None, alarm_phase=False, hold=None, export=None, clock_set=True):
     """`export` is (phase, progress, current, total) with phase one of
     "linked", "copy", "verify", "delete", "done"."""
     s = Screen()
@@ -156,6 +156,8 @@ def render(state, linked=True, elapsed=0, disk_pct=42, free_gb=128,
         s.text_centered("ERROR", CX, CY, 3, C_RED)
     else:
         s.fill_circle(CX, CY, CENTER_R, C_DKGREY)
+        if not clock_set:
+            s.text_centered("CLOCK NOT SET", CX, CY - 38, 1, C_AMBER)
         s.text_centered("IDLE", CX, CY - 10, 3, C_WHITE)
         s.text_centered("HOLD TO REC", CX, CY + 20, 1, C_WHITE)
         if ex_phase == "linked":
@@ -171,6 +173,7 @@ def main():
     good_hz = [30, 15, 500, 500, 500]
     panels = [
         ("IDLE", render("idle")),
+        ("CLOCK NOT SET", render("idle", clock_set=False)),
         ("HOLD 1 s", render("idle", hold=0.65)),
         ("RECORDING", render("rec", elapsed=83, hz=good_hz, ok=[1] * 5)),
         ("PAUSED", render("paused", elapsed=83)),

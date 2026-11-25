@@ -4,6 +4,9 @@
 // status line several times a second and this firmware renders it. Presses
 // on the centre circle send requests back: hold 1 s to start (idle) or stop
 // (recording or paused); double tap to pause (recording) or resume (paused).
+// "$C,<0|1>" says whether the Jetson's clock has been set since it was switched
+// on; while it is 0 the idle page shows CLOCK NOT SET (hosts that never send it
+// get no warning).
 //
 // Host -> screen:
 //   $S,<state>,<elapsed_s>,<disk_used_pct>,<disk_free_gb>,
@@ -125,7 +128,22 @@ static bool touch_get(int *x, int *y) {
 static char line[200];
 static size_t line_len = 0;
 
+static bool clock_set = true;      // last "$C" from the host
+static uint32_t last_clock_ms = 0;
+static const uint32_t CLOCK_TIMEOUT_MS = 5000;
+
+static bool clock_warning(uint32_t now) {
+  return !clock_set && last_clock_ms != 0 && now - last_clock_ms < CLOCK_TIMEOUT_MS;
+}
+
 static void parse_line(const char *s) {
+  if (strncmp(s, "$C,", 3) == 0) {
+    int v;
+    if (sscanf(s + 3, "%d", &v) != 1) return;
+    clock_set = v != 0;
+    last_clock_ms = millis();
+    return;
+  }
   if (strncmp(s, "$X,", 3) == 0) {
     int v[4];
     if (sscanf(s + 3, "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]) != 4) return;
@@ -315,6 +333,7 @@ static void draw_center(bool linked, uint32_t now) {
       break;
     default:
       gfx->fillCircle(CX, CY, CENTER_R, C_DKGREY);
+      if (clock_warning(now)) text_centered("CLOCK NOT SET", CX, CY - 38, 1, C_AMBER);
       text_centered("IDLE", CX, CY - 10, 3, C_WHITE);
       text_centered("HOLD TO REC", CX, CY + 20, 1, C_WHITE);
       if (ex.phase == EX_LINKED) text_centered("PC LINKED", CX, CY + 36, 1, C_GREEN);

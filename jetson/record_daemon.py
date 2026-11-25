@@ -54,10 +54,10 @@ except ImportError:
 from .config import (
     DATA_ROOT, HOST, INTERFACE, PORT, PROTOCOL_VERSION, SCREEN_TASK, TASKS,
 )
-from . import export_api
+from . import clock, export_api
 from .recorder import Recorder, RecorderStateError, RecordingError
 from .screen_link import (
-    NOMINAL_HZ, SENSORS, ScreenLink, SensorHealth, format_export, format_status,
+    NOMINAL_HZ, SENSORS, ScreenLink, SensorHealth, format_clock, format_export, format_status,
 )
 
 
@@ -145,6 +145,7 @@ def _screen_stop():
     except Exception as e:
         print(f"[record_daemon] Screen stop failed: {e}")
         _screen_error_until = time.time() + SCREEN_ERROR_HOLD_S
+    _correct_recordings()        # the clock may have been set while it was recording
 
 
 def _screen_pause():
@@ -167,6 +168,7 @@ def _screen_loop():
     """Push recorder state, stream rates and disk usage to the screen."""
     health = {name: SensorHealth(NOMINAL_HZ[name]) for name in SENSORS}
     was_live = False
+    clock_was_set = None
     while True:
         now = time.time()
         state = _recorder.state
@@ -197,6 +199,11 @@ def _screen_loop():
         _screen.send(format_status(state, _recorder.elapsed, used_pct, free_gb, hz, ok))
         ex = export_api.export_state()
         _screen.send(format_export(ex["phase"], ex["progress"], ex["current"], ex["total"]))
+        clock_set = clock.trusted()
+        _screen.send(format_clock(clock_set))
+        if clock_set and clock_was_set is False:       # set meanwhile (e.g. chrony): correct earlier recordings
+            _correct_recordings()
+        clock_was_set = clock_set
         time.sleep(1.0 / SCREEN_SEND_HZ)
 
 
@@ -234,7 +241,9 @@ def stop():
     except RecorderStateError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except RecordingError as e:
+        _correct_recordings()
         raise HTTPException(status_code=500, detail=str(e))
+    _correct_recordings()        # the clock may have been set while it was recording
     return {
         "status":          "stopped",
         "session_dir":     result["session_dir"],
@@ -353,6 +362,16 @@ def resync_clock():
     }
 
 
+def _correct_recordings():
+    """clock_correction.json for recordings of this boot made before the clock was set (clock.py)."""
+    try:
+        done = clock.correct_sessions(DATA_ROOT, skip=_recorder.session_dir)
+        if done:
+            print(f"[record_daemon] Clock corrections written: {done}")
+    except Exception as e:                       # never let this break a stop
+        print(f"[record_daemon] Clock corrections failed: {e}")
+
+
 @app.get("/status")
 def status():
     assert _recorder is not None
@@ -362,6 +381,7 @@ def status():
         "state":           _recorder.state,   # "idle" | "recording" | "saving"
         "recording":       _recorder.state == "recording",
         "paused":          _recorder.paused,
+        "clock_set":       clock.trusted(),
         "elapsed":         round(_recorder.elapsed, 2),
         "samples":         _recorder.samples(),
         "live_fps":        _recorder.live_fps(),

@@ -62,6 +62,8 @@ After updating code, restart the service only when recording and export have fin
 
 1. Power on the screen with its side button. Wait for `IDLE`. `NO LINK`
    means it is not receiving daemon status; check USB and the service.
+   `CLOCK NOT SET` means the Jetson's clock has not been set since it was
+   switched on: connect the laptop and open the offload tool first.
 2. Check `FREE`. At 640×480 and 30 Hz, depth alone uses about 1.1 GB/min;
    RGB and LiDAR add to this.
 3. Hold the centre for one second to start. Samples are kept from two
@@ -134,7 +136,13 @@ recordings while their heartbeat remains current; the lease expires after
 five seconds without an update. Use one offload client at a time.
 
 The Jetson has no clock battery: at boot it restores the last saved time.
-Connecting the offload tool sets the clock, so connect once before recording.
+Connecting the offload tool sets the clock (`POST /time`), so connect once
+before recording; until then the screen shows `CLOCK NOT SET` (a chrony sync
+also counts). Recordings made before the clock was set get
+`first_person/clock_correction.json` when it is set, as long as the robot was
+not switched off in between (`jetson/clock.py`): add its `offset_s` to every
+timestamp of that recording to get the real time. The recorded files are not
+changed, and the session folder keeps its (wrong) date and time.
 
 ## Files and conversion
 
@@ -178,6 +186,10 @@ preserves raw inputs. Do not record into or export a session during conversion.
   Missing intensity is zero. `lidar_meta.json` records the reported frame ID.
 - `session_meta.json`: task, prompt, planned start time, recorded seconds,
   pauses (`[[start, end], ...]`, Unix time), counts and collector summaries. `clean_stop` is false if shutdown reported an error. Mock sessions are labelled.
+  `clock` is `{boot_id, boot_epoch, trusted}`: whether the clock had been set when recording started, and the data
+  needed to correct it later.
+- `clock_correction.json` (only for recordings made before the clock was set): `offset_s` (real time = recorded
+  time + `offset_s`), the corrected `start_time`, and how the clock was set.
 
 ## Timing
 
@@ -199,7 +211,7 @@ backend.
 | `POST /start` | Body: `task`, optional `prompt`, `session_date` (`MM_DD_YYYY`), `session_id` (`HH_MM_SS`). Existing explicit IDs are rejected. |
 | `POST /stop` | Stop capture, drain writers, close files; reports failure if a collector cannot save cleanly. |
 | `POST /pause`, `POST /resume` | Keep the session open but keep no data in between. |
-| `GET /status` | State, `paused`, recorded time, counts, rates, screen connection, current session, `code_version`. |
+| `GET /status` | State, `paused`, `clock_set`, recorded time, counts, rates, screen connection, current session, `code_version`. |
 | `POST /resync_clock` | Restart chrony and report convergence. |
 | `/sessions…`, `/export/state`, `/time` | Export and clock APIs; see `jetson/export_api.py`. |
 
